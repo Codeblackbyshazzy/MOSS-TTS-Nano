@@ -368,9 +368,23 @@ class StreamingJob:
     channels: int = 2
     emitted_audio_seconds: float = 0.0
     lead_seconds: float = 0.0
+    current_chunk_index: int | None = None
+    text_chunks: list[str] = field(default_factory=list)
+    chunk_index_base: int | None = None
+    audio_chunk_ranges: list[tuple[float, float, int]] = field(default_factory=list)
     is_closed: bool = False
     final_result: dict[str, object] | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _resolve_playback_chunk_index_locked(self) -> int | None:
+        if not self.audio_chunk_ranges:
+            return self.current_chunk_index
+
+        playback_audio_seconds = max(0.0, float(self.emitted_audio_seconds) - float(self.lead_seconds))
+        for start_seconds, end_seconds, chunk_index in self.audio_chunk_ranges:
+            if playback_audio_seconds <= end_seconds + 1e-6:
+                return chunk_index
+        return self.audio_chunk_ranges[-1][2]
 
     def snapshot(self) -> dict[str, object]:
         with self.lock:
@@ -384,6 +398,9 @@ class StreamingJob:
                 "channels": self.channels,
                 "emitted_audio_seconds": self.emitted_audio_seconds,
                 "lead_seconds": self.lead_seconds,
+                "current_chunk_index": self.current_chunk_index,
+                "playback_chunk_index": self._resolve_playback_chunk_index_locked(),
+                "text_chunks": list(self.text_chunks),
                 "first_audio_latency_seconds": (
                     None
                     if self.started_at is None or self.first_audio_at is None
@@ -484,6 +501,41 @@ def _format_stream_status(snapshot: dict[str, object]) -> str:
     if bool(snapshot.get("closed")):
         return "Stream closed."
     return str(snapshot.get("run_status") or "Streaming...")
+
+
+def _normalize_stream_chunk_index(
+    raw_chunk_index: object,
+    *,
+    chunk_count: int,
+    current_base: int | None,
+) -> tuple[int | None, int | None]:
+    try:
+        numeric_chunk_index = int(raw_chunk_index)
+    except Exception:
+        return None, current_base
+
+    if chunk_count <= 0:
+        return max(0, numeric_chunk_index), current_base
+
+    normalized_base = current_base
+    if normalized_base is None:
+        if numeric_chunk_index == 0:
+            normalized_base = 0
+        elif numeric_chunk_index == chunk_count:
+            normalized_base = 1
+        elif numeric_chunk_index == 1:
+            normalized_base = 1
+        else:
+            normalized_base = 0
+
+    normalized_chunk_index = numeric_chunk_index - normalized_base
+    if 0 <= normalized_chunk_index < chunk_count:
+        return normalized_chunk_index, normalized_base
+    if 0 <= numeric_chunk_index < chunk_count:
+        return numeric_chunk_index, 0
+    if 1 <= numeric_chunk_index <= chunk_count:
+        return numeric_chunk_index - 1, 1
+    return None, normalized_base
 
 
 def _audio_to_wav_bytes(audio_array, sample_rate: int) -> bytes:
@@ -617,6 +669,8 @@ def _render_index_html(
       --line: #d1d5db;
       --accent: #0f766e;
       --accent-strong: #115e59;
+      --accent-soft: rgba(15, 118, 110, 0.12);
+      --accent-tint: #eef8f6;
       --danger: #b91c1c;
     }
     body {
@@ -730,6 +784,45 @@ def _render_index_html(
       font-size: 13px;
       color: var(--muted);
       margin-top: 8px;
+    }
+    .playback-script {
+      min-height: 104px;
+      display: flex;
+      flex-wrap: wrap;
+      align-content: flex-start;
+      gap: 10px;
+      padding: 14px;
+      border: 1px solid #d8e3e0;
+      border-radius: 14px;
+      background: linear-gradient(180deg, #fbfefd 0%, var(--accent-tint) 100%);
+      overflow: auto;
+    }
+    .playback-script.empty {
+      display: block;
+      color: var(--muted);
+    }
+    .playback-segment {
+      display: inline-flex;
+      align-items: center;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid #d7e2df;
+      background: #ffffff;
+      color: #475569;
+      line-height: 1.6;
+      transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+    }
+    .playback-segment.played {
+      border-color: rgba(15, 118, 110, 0.18);
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+    }
+    .playback-segment.active {
+      border-color: var(--accent-strong);
+      background: var(--accent);
+      color: #ffffff;
+      box-shadow: 0 10px 24px rgba(15, 118, 110, 0.22);
+      transform: translateY(-1px);
     }
     audio {
       width: 100%;
@@ -908,6 +1001,10 @@ def _render_index_html(
           <textarea id="normalized-text-output" readonly style="min-height: 120px;"></textarea>
         </div>
         <div class="field">
+          <label>Playback Script</label>
+          <div id="playback-script" class="playback-script empty">The current sentence will be highlighted here during playback.</div>
+        </div>
+        <div class="field">
           <label>Resolved Prompt Speech</label>
           <div id="resolved-prompt" class="meta"></div>
         </div>
@@ -934,7 +1031,9 @@ def _render_index_html(
     const textNormalizationStatus = document.getElementById("text-normalization-status");
     const runStatus = document.getElementById("run-status");
     const streamMetrics = document.getElementById("stream-metrics");
+    const textInput = document.getElementById("text");
     const normalizedTextOutput = document.getElementById("normalized-text-output");
+    const playbackScript = document.getElementById("playback-script");
     const resolvedPrompt = document.getElementById("resolved-prompt");
     const audioOutput = document.getElementById("audio-output");
     const generateBtn = document.getElementById("generate-btn");
@@ -951,6 +1050,11 @@ def _render_index_html(
     let nextPlaybackTime = 0;
     let currentInitialPlaybackDelaySeconds = 0.08;
     let currentRealtimePlaybackPaused = false;
+    let currentRealtimePlaybackCompletionTimer = null;
+    let playbackChunks = [];
+    let bufferedPlaybackBoundaries = [];
+    let currentPlaybackChunkIndex = null;
+    let currentPlaybackMarkedComplete = false;
 
     const demosById = new Map();
     for (const demo of DEMOS) {
@@ -988,7 +1092,8 @@ def _render_index_html(
         selectedDemoPrompt.textContent = "No demos available.";
         resolvedPrompt.textContent = "";
         promptAudioSource.textContent = "";
-        document.getElementById("text").value = "";
+        textInput.value = "";
+        renderPlaybackScript([], "");
         generateBtn.disabled = true;
         return;
       }
@@ -1000,8 +1105,9 @@ def _render_index_html(
         ? "Using uploaded prompt speech for synthesis."
         : "Using the selected demo prompt speech.";
       if (replaceText) {
-        document.getElementById("text").value = demo.text || "";
+        textInput.value = demo.text || "";
       }
+      previewPlaybackScriptFromInputs();
       generateBtn.disabled = false;
     }
 
@@ -1018,6 +1124,9 @@ def _render_index_html(
       audioOutput.pause();
       audioOutput.removeAttribute("src");
       audioOutput.load();
+      bufferedPlaybackBoundaries = [];
+      currentPlaybackMarkedComplete = false;
+      setPlaybackHighlight(null);
       updatePauseButtonState();
     }
 
@@ -1027,6 +1136,162 @@ def _render_index_html(
 
     function updateNormalizedOutputs(payload) {
       normalizedTextOutput.value = payload.normalized_text || "";
+    }
+
+    function splitTextForDisplay(text) {
+      const normalizedText = String(text || "").trim();
+      if (!normalizedText) {
+        return [];
+      }
+
+      const segments = [];
+      for (const rawLine of normalizedText.split(/\\n+/)) {
+        const line = rawLine.trim();
+        if (!line) {
+          continue;
+        }
+        const parts = line.match(/[^。！？!?；;.\\n]+(?:[。！？!?；;]+|\\.(?=\\s|$)|$)/g);
+        if (parts && parts.length > 1) {
+          for (const part of parts) {
+            const cleanedPart = part.trim();
+            if (cleanedPart) {
+              segments.push(cleanedPart);
+            }
+          }
+          continue;
+        }
+        segments.push(line);
+      }
+      return segments.length ? segments : [normalizedText];
+    }
+
+    function normalizePlaybackChunks(chunks, fallbackText = "") {
+      if (Array.isArray(chunks)) {
+        const normalizedChunks = chunks
+          .map((chunk) => String(chunk || "").trim())
+          .filter(Boolean);
+        if (normalizedChunks.length > 0) {
+          return normalizedChunks;
+        }
+      }
+      return splitTextForDisplay(fallbackText);
+    }
+
+    function rebuildBufferedPlaybackBoundaries() {
+      bufferedPlaybackBoundaries = [];
+      if (!playbackChunks.length) {
+        return;
+      }
+      const duration = Number(audioOutput.duration);
+      if (!Number.isFinite(duration) || duration <= 0) {
+        return;
+      }
+
+      const weights = playbackChunks.map((chunk) => {
+        const compactChunk = String(chunk).replace(/\\s+/g, "");
+        return Math.max(1, Array.from(compactChunk).length);
+      });
+      const totalWeight = weights.reduce((sum, value) => sum + value, 0);
+      let accumulatedSeconds = 0;
+      bufferedPlaybackBoundaries = weights.map((weight) => {
+        accumulatedSeconds += (duration * weight) / totalWeight;
+        return accumulatedSeconds;
+      });
+    }
+
+    function setPlaybackHighlight(activeIndex, options = {}) {
+      const markAllPlayed = Boolean(options.markAllPlayed);
+      const segmentNodes = playbackScript.querySelectorAll(".playback-segment");
+      let normalizedActiveIndex = null;
+      if (segmentNodes.length > 0 && activeIndex !== null && activeIndex !== undefined) {
+        const numericIndex = Number(activeIndex);
+        if (Number.isFinite(numericIndex)) {
+          normalizedActiveIndex = Math.max(0, Math.min(segmentNodes.length - 1, Math.trunc(numericIndex)));
+        }
+      }
+
+      const shouldScroll =
+        normalizedActiveIndex !== null &&
+        normalizedActiveIndex !== currentPlaybackChunkIndex &&
+        !markAllPlayed;
+
+      segmentNodes.forEach((node, index) => {
+        const isActive = normalizedActiveIndex !== null && index === normalizedActiveIndex && !markAllPlayed;
+        const isPlayed = markAllPlayed || (normalizedActiveIndex !== null && index < normalizedActiveIndex);
+        node.classList.toggle("active", isActive);
+        node.classList.toggle("played", isPlayed);
+      });
+
+      if (shouldScroll) {
+        segmentNodes[normalizedActiveIndex].scrollIntoView({
+          block: "nearest",
+          inline: "nearest",
+          behavior: "smooth"
+        });
+      }
+
+      currentPlaybackChunkIndex = normalizedActiveIndex;
+      currentPlaybackMarkedComplete = markAllPlayed;
+    }
+
+    function renderPlaybackScript(chunks, fallbackText = "") {
+      playbackChunks = normalizePlaybackChunks(chunks, fallbackText);
+      bufferedPlaybackBoundaries = [];
+      currentPlaybackChunkIndex = null;
+      currentPlaybackMarkedComplete = false;
+      playbackScript.innerHTML = "";
+
+      if (!playbackChunks.length) {
+        playbackScript.classList.add("empty");
+        playbackScript.textContent = "The current sentence will be highlighted here during playback.";
+        return;
+      }
+
+      playbackScript.classList.remove("empty");
+      for (const chunk of playbackChunks) {
+        const segmentNode = document.createElement("span");
+        segmentNode.className = "playback-segment";
+        segmentNode.textContent = chunk;
+        playbackScript.appendChild(segmentNode);
+      }
+      rebuildBufferedPlaybackBoundaries();
+      setPlaybackHighlight(null);
+    }
+
+    function updateBufferedPlaybackHighlight() {
+      if (!hasBufferedPlayback() || !playbackChunks.length || currentPlaybackMarkedComplete) {
+        return;
+      }
+      if (audioOutput.ended) {
+        setPlaybackHighlight(null, { markAllPlayed: true });
+        return;
+      }
+      if (!Number.isFinite(audioOutput.duration) || audioOutput.duration <= 0) {
+        if (!audioOutput.paused) {
+          setPlaybackHighlight(0);
+        }
+        return;
+      }
+      if (!bufferedPlaybackBoundaries.length) {
+        rebuildBufferedPlaybackBoundaries();
+      }
+      if (!bufferedPlaybackBoundaries.length) {
+        return;
+      }
+
+      const clampedCurrentTime = Math.max(0, Math.min(Number(audioOutput.currentTime || 0), Number(audioOutput.duration)));
+      let activeIndex = bufferedPlaybackBoundaries.findIndex((boundary) => clampedCurrentTime <= boundary);
+      if (activeIndex < 0) {
+        activeIndex = playbackChunks.length - 1;
+      }
+      setPlaybackHighlight(activeIndex);
+    }
+
+    function previewPlaybackScriptFromInputs() {
+      if (hasBufferedPlayback() || hasRealtimePlayback()) {
+        return;
+      }
+      renderPlaybackScript([], textInput.value);
     }
 
     function hasBufferedPlayback() {
@@ -1074,7 +1339,7 @@ def _render_index_html(
       const demo = getSelectedDemo();
       const uploadedPromptAudio = getUploadedPromptAudioFile();
       const formData = new FormData();
-      formData.append("text", document.getElementById("text").value);
+      formData.append("text", textInput.value);
       if (demo) {
         formData.append("demo_id", demo.id);
       }
@@ -1145,7 +1410,56 @@ def _render_index_html(
       nextPlaybackTime = startAt + audioBuffer.duration;
     }
 
+    function clearRealtimePlaybackCompletionTimer() {
+      if (currentRealtimePlaybackCompletionTimer) {
+        window.clearTimeout(currentRealtimePlaybackCompletionTimer);
+        currentRealtimePlaybackCompletionTimer = null;
+      }
+    }
+
+    function monitorRealtimePlaybackCompletion() {
+      clearRealtimePlaybackCompletionTimer();
+      if (!currentAudioContext) {
+        return;
+      }
+
+      async function pollRealtimePlaybackCompletion() {
+        if (!currentAudioContext) {
+          return;
+        }
+        if (currentRealtimePlaybackPaused) {
+          currentRealtimePlaybackCompletionTimer = window.setTimeout(() => {
+            pollRealtimePlaybackCompletion().catch(() => {});
+          }, 120);
+          return;
+        }
+
+        const remainingSeconds = nextPlaybackTime - currentAudioContext.currentTime;
+        if (remainingSeconds > 0.05) {
+          currentRealtimePlaybackCompletionTimer = window.setTimeout(() => {
+            pollRealtimePlaybackCompletion().catch(() => {});
+          }, 120);
+          return;
+        }
+
+        setPlaybackHighlight(null, { markAllPlayed: true });
+        try {
+          await currentAudioContext.close();
+        } catch (error) {
+        }
+        currentAudioContext = null;
+        currentRealtimePlaybackPaused = false;
+        nextPlaybackTime = 0;
+        updatePauseButtonState();
+      }
+
+      currentRealtimePlaybackCompletionTimer = window.setTimeout(() => {
+        pollRealtimePlaybackCompletion().catch(() => {});
+      }, 120);
+    }
+
     async function closeRealtimeStream() {
+      clearRealtimePlaybackCompletionTimer();
       if (currentStreamStatusTimer) {
         window.clearInterval(currentStreamStatusTimer);
         currentStreamStatusTimer = null;
@@ -1169,6 +1483,8 @@ def _render_index_html(
       }
       nextPlaybackTime = 0;
       currentRealtimePlaybackPaused = false;
+      currentPlaybackMarkedComplete = false;
+      setPlaybackHighlight(null);
       updatePauseButtonState();
     }
 
@@ -1199,10 +1515,13 @@ def _render_index_html(
       });
 
       updateNormalizedOutputs(data);
+      renderPlaybackScript(data.text_chunks, data.normalized_text || textInput.value);
       const audioBlob = base64ToBlob(data.audio_base64, "audio/wav");
       currentAudioObjectUrl = URL.createObjectURL(audioBlob);
       audioOutput.src = currentAudioObjectUrl;
       audioOutput.play().catch(() => {});
+      rebuildBufferedPlaybackBoundaries();
+      updateBufferedPlaybackHighlight();
       updatePauseButtonState();
       resolvedPrompt.textContent = data.prompt_audio_path || "";
       setStatus(runStatus, data.run_status || "Done.");
@@ -1234,6 +1553,7 @@ def _render_index_html(
         setStatus(textNormalizationStatus, startData.text_normalization_status_text);
       }
       updateNormalizedOutputs(startData);
+      renderPlaybackScript(startData.text_chunks, startData.normalized_text || textInput.value);
 
       const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextCtor) {
@@ -1244,6 +1564,7 @@ def _render_index_html(
       await currentAudioContext.resume();
       nextPlaybackTime = currentAudioContext.currentTime + currentInitialPlaybackDelaySeconds;
       currentRealtimePlaybackPaused = false;
+      clearRealtimePlaybackCompletionTimer();
       updatePauseButtonState();
       currentStreamAbortController = new AbortController();
 
@@ -1267,6 +1588,9 @@ def _render_index_html(
         streamMetrics.textContent = metrics.join(" | ");
         if (snapshot.prompt_audio_path) {
           resolvedPrompt.textContent = snapshot.prompt_audio_path;
+        }
+        if (!currentRealtimePlaybackPaused && snapshot.playback_chunk_index !== null && snapshot.playback_chunk_index !== undefined) {
+          setPlaybackHighlight(snapshot.playback_chunk_index);
         }
         return snapshot;
       }
@@ -1329,7 +1653,14 @@ def _render_index_html(
       }
       resolvedPrompt.textContent = result.prompt_audio_path || resolvedPrompt.textContent;
       streamMetrics.textContent = result.stream_metrics || streamMetrics.textContent;
+      if (Array.isArray(result.text_chunks) && result.text_chunks.length > 0) {
+        renderPlaybackScript(result.text_chunks, normalizedTextOutput.value || textInput.value);
+      }
+      if (playbackChunks.length > 0) {
+        setPlaybackHighlight(playbackChunks.length - 1);
+      }
       setStatus(runStatus, result.run_status || "Stream complete.");
+      monitorRealtimePlaybackCompletion();
       updatePauseButtonState();
     }
 
@@ -1364,6 +1695,7 @@ def _render_index_html(
       try {
         const formData = buildFormData();
         clearNormalizedOutputs();
+        renderPlaybackScript([], textInput.value);
         if (realtimeStreamToggle.checked) {
           await generateRealtime(formData);
         } else {
@@ -1407,9 +1739,22 @@ def _render_index_html(
       });
     });
     refreshBtn.addEventListener("click", refreshWarmupStatus);
-    audioOutput.addEventListener("play", updatePauseButtonState);
+    textInput.addEventListener("input", previewPlaybackScriptFromInputs);
+    audioOutput.addEventListener("loadedmetadata", () => {
+      rebuildBufferedPlaybackBoundaries();
+      updateBufferedPlaybackHighlight();
+    });
+    audioOutput.addEventListener("timeupdate", updateBufferedPlaybackHighlight);
+    audioOutput.addEventListener("play", () => {
+      currentPlaybackMarkedComplete = false;
+      updatePauseButtonState();
+      updateBufferedPlaybackHighlight();
+    });
     audioOutput.addEventListener("pause", updatePauseButtonState);
-    audioOutput.addEventListener("ended", updatePauseButtonState);
+    audioOutput.addEventListener("ended", () => {
+      updatePauseButtonState();
+      setPlaybackHighlight(null, { markAllPlayed: true });
+    });
     updatePauseButtonState();
     applySelectedDemo(true);
     refreshWarmupStatus();
@@ -1454,6 +1799,32 @@ def _build_app(
     runtime_manager = RequestRuntimeManager(runtime)
     demo_entries = _load_demo_entries()
     demo_entries_by_id = {demo_entry.demo_id: demo_entry for demo_entry in demo_entries}
+
+    def _resolve_voice_clone_text_chunks(
+        *,
+        text: str,
+        voice_clone_max_text_tokens: int,
+        cpu_threads: int,
+    ) -> list[str]:
+        normalized_text = str(text or "").strip()
+        if not normalized_text:
+            return []
+
+        try:
+            chunks, _, _ = runtime_manager.call_with_runtime(
+                requested_execution_device="cpu",
+                cpu_threads=cpu_threads,
+                callback=lambda selected_runtime: selected_runtime.split_voice_clone_text(
+                    text=normalized_text,
+                    voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
+                ),
+            )
+        except Exception:
+            logging.warning("failed to resolve playback text chunks", exc_info=True)
+            return [normalized_text]
+
+        normalized_chunks = [str(chunk).strip() for chunk in chunks if str(chunk).strip()]
+        return normalized_chunks or [normalized_text]
 
     def _resolve_demo_entry(demo_id: str) -> DemoEntry:
         normalized_demo_id = str(demo_id or "").strip()
@@ -1595,13 +1966,33 @@ def _build_app(
                     pcm_bytes = _audio_to_pcm16le_bytes(waveform_numpy)
                     if not pcm_bytes:
                         continue
+                    sample_rate = int(event["sample_rate"])
                     channels = 1 if waveform_numpy.ndim == 1 else int(waveform_numpy.shape[1])
+                    is_pause = bool(event.get("is_pause", False))
+                    event_duration_seconds = (
+                        float(waveform_numpy.shape[0]) / float(sample_rate)
+                        if sample_rate > 0 and waveform_numpy.ndim >= 1
+                        else 0.0
+                    )
                     with job.lock:
-                        job.sample_rate = int(event["sample_rate"])
+                        job.sample_rate = sample_rate
                         job.channels = channels
                         job.emitted_audio_seconds = float(event.get("emitted_audio_seconds", 0.0))
                         job.lead_seconds = float(event.get("lead_seconds", 0.0))
-                        if job.first_audio_at is None and not bool(event.get("is_pause", False)):
+                        normalized_chunk_index, job.chunk_index_base = _normalize_stream_chunk_index(
+                            event.get("chunk_index"),
+                            chunk_count=len(job.text_chunks),
+                            current_base=job.chunk_index_base,
+                        )
+                        if normalized_chunk_index is not None:
+                            job.current_chunk_index = normalized_chunk_index
+                            if not is_pause and event_duration_seconds > 0.0:
+                                chunk_end_seconds = job.emitted_audio_seconds
+                                chunk_start_seconds = max(0.0, chunk_end_seconds - event_duration_seconds)
+                                job.audio_chunk_ranges.append(
+                                    (chunk_start_seconds, chunk_end_seconds, normalized_chunk_index)
+                                )
+                        if job.first_audio_at is None and not is_pause:
                             job.first_audio_at = time.monotonic()
                         job.run_status = (
                             f"Streaming | emitted={job.emitted_audio_seconds:.2f}s | lead={job.lead_seconds:.2f}s"
@@ -1621,6 +2012,7 @@ def _build_app(
                             "audio_path": event.get("audio_path"),
                             "prompt_audio_path": prompt_audio_display_path,
                             "run_status": formatted_run_status,
+                            "text_chunks": list(job.text_chunks),
                         }
                         job.prompt_audio_path = prompt_audio_display_path
                         job.state = "done"
@@ -1767,9 +2159,15 @@ def _build_app(
 
         try:
             normalized_seed = None if seed in {"", "0"} else int(seed)
+            text_chunks = _resolve_voice_clone_text_chunks(
+                text=str(prepared_texts["text"]),
+                voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
+                cpu_threads=int(cpu_threads),
+            )
             job = stream_jobs.create()
             with job.lock:
                 job.prompt_audio_path = prompt_audio_display_path
+                job.text_chunks = list(text_chunks)
             thread = threading.Thread(
                 target=_run_streaming_job,
                 kwargs={
@@ -1815,6 +2213,7 @@ def _build_app(
                 "text_normalization_status_text": _text_normalization_status_text(
                     text_normalizer_manager.snapshot() if text_normalizer_manager is not None else None
                 ),
+                "text_chunks": text_chunks,
                 "normalized_text": str(prepared_texts["normalized_text"]),
                 "normalization_method": str(prepared_texts["normalization_method"]),
                 "text_normalization_language": str(prepared_texts["text_normalization_language"]),
@@ -1877,6 +2276,7 @@ def _build_app(
             "run_status": result.get("run_status") or snapshot["run_status"],
             "stream_metrics": _stream_metrics_text(snapshot),
             "warmup_status_text": _warmup_status_text(warmup_manager.snapshot()),
+            "text_chunks": result.get("text_chunks") or snapshot.get("text_chunks") or [],
         }
 
     @app.post("/api/generate-stream/{stream_id}/close")
@@ -1979,6 +2379,17 @@ def _build_app(
             result["prompt_audio_display_path"] = prompt_audio_display_path
             if resolved_cpu_threads is not None:
                 result["cpu_threads"] = resolved_cpu_threads
+            text_chunks = [
+                str(chunk).strip()
+                for chunk in (result.get("voice_clone_text_chunks") or [])
+                if str(chunk).strip()
+            ]
+            if not text_chunks:
+                text_chunks = _resolve_voice_clone_text_chunks(
+                    text=str(prepared_texts["text"]),
+                    voice_clone_max_text_tokens=int(voice_clone_max_text_tokens),
+                    cpu_threads=int(cpu_threads),
+                )
             generated_audio_path = str(result["audio_path"])
             wav_bytes = _audio_to_wav_bytes(result["waveform_numpy"], int(result["sample_rate"]))
             return {
@@ -1990,6 +2401,7 @@ def _build_app(
                 "text_normalization_status_text": _text_normalization_status_text(
                     text_normalizer_manager.snapshot() if text_normalizer_manager is not None else None
                 ),
+                "text_chunks": text_chunks,
                 "normalized_text": str(prepared_texts["normalized_text"]),
                 "normalization_method": str(prepared_texts["normalization_method"]),
                 "text_normalization_language": str(prepared_texts["text_normalization_language"]),

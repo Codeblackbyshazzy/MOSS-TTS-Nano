@@ -383,6 +383,42 @@ class NanoTTSService:
         with self._lock:
             return self._load_model_locked()
 
+    def split_voice_clone_text(
+        self,
+        *,
+        text: str,
+        voice_clone_max_text_tokens: int = 75,
+    ) -> list[str]:
+        normalized_text = str(text or "").strip()
+        if not normalized_text:
+            return []
+
+        try:
+            max_tokens = int(voice_clone_max_text_tokens)
+        except Exception:
+            max_tokens = 75
+        if max_tokens <= 0:
+            return [normalized_text]
+
+        with self._lock:
+            model = self._load_model_locked()
+            if not hasattr(model, "_load_text_tokenizer") or not hasattr(model, "_split_text_into_best_sentences"):
+                return [normalized_text]
+
+            text_tokenizer = model._load_text_tokenizer(
+                text_tokenizer=None,
+                text_tokenizer_path=self.checkpoint_path,
+            )
+            split_chunks = model._split_text_into_best_sentences(
+                text_tokenizer=text_tokenizer,
+                text=normalized_text,
+                max_tokens=max_tokens,
+            )
+
+        effective_chunks = split_chunks if len(split_chunks) > 1 else [normalized_text]
+        cleaned_chunks = [str(chunk).strip() for chunk in effective_chunks if str(chunk).strip()]
+        return cleaned_chunks or [normalized_text]
+
     def list_voice_names(self) -> list[str]:
         return list(self.voice_presets.keys())
 
