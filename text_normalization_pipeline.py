@@ -149,58 +149,79 @@ def prepare_tts_request_texts(
     raw_text = str(text or "")
     raw_prompt_text = str(prompt_text or "")
 
+    normalization_stages: list[str] = []
     normalization_language = ""
     intermediate_text = raw_text
     intermediate_prompt_text = raw_prompt_text
 
+    if enable_normalize_tts_text and enable_wetext:
+        pre_robust_text = normalize_tts_text(raw_text)
+        pre_robust_prompt_text = normalize_tts_text(raw_prompt_text) if raw_prompt_text else ""
+        if pre_robust_text != raw_text:
+            logging.info(
+                "normalized text chars_before=%d chars_after=%d stage=robust_pre",
+                len(raw_text),
+                len(pre_robust_text),
+            )
+        if raw_prompt_text and pre_robust_prompt_text != raw_prompt_text:
+            logging.info(
+                "normalized prompt_text chars_before=%d chars_after=%d stage=robust_pre",
+                len(raw_prompt_text),
+                len(pre_robust_prompt_text),
+            )
+        intermediate_text = pre_robust_text
+        intermediate_prompt_text = pre_robust_prompt_text
+        normalization_stages.append("robust_pre")
+
     if enable_wetext:
         if text_normalizer_manager is None:
             raise RuntimeError("WeTextProcessing manager is unavailable.")
-        normalization_language = resolve_text_normalization_language(text=raw_text, voice=voice)
+        wetext_input_text = intermediate_text
+        wetext_input_prompt_text = intermediate_prompt_text
+        normalization_language = resolve_text_normalization_language(text=wetext_input_text, voice=voice)
         intermediate_text, intermediate_prompt_text = text_normalizer_manager.normalize(
-            text=raw_text,
-            prompt_text=raw_prompt_text,
+            text=wetext_input_text,
+            prompt_text=wetext_input_prompt_text,
             language=normalization_language,
         )
-        if intermediate_text != raw_text:
+        if intermediate_text != wetext_input_text:
             logging.info(
                 "normalized text chars_before=%d chars_after=%d stage=wetext language=%s",
-                len(raw_text),
+                len(wetext_input_text),
                 len(intermediate_text),
                 normalization_language,
             )
-        if raw_prompt_text and intermediate_prompt_text != raw_prompt_text:
+        if wetext_input_prompt_text and intermediate_prompt_text != wetext_input_prompt_text:
             logging.info(
                 "normalized prompt_text chars_before=%d chars_after=%d stage=wetext language=%s",
-                len(raw_prompt_text),
+                len(wetext_input_prompt_text),
                 len(intermediate_prompt_text),
                 normalization_language,
             )
+        normalization_stages.append(f"wetext:{normalization_language}" if normalization_language else "wetext")
 
     final_text = intermediate_text
     final_prompt_text = intermediate_prompt_text
     if enable_normalize_tts_text:
         final_text = normalize_tts_text(intermediate_text)
         final_prompt_text = normalize_tts_text(intermediate_prompt_text) if intermediate_prompt_text else ""
+        robust_stage_name = "robust_post" if enable_wetext else "robust"
 
         if final_text != intermediate_text:
             logging.info(
-                "normalized text chars_before=%d chars_after=%d stage=robust_final",
+                "normalized text chars_before=%d chars_after=%d stage=%s",
                 len(intermediate_text),
                 len(final_text),
+                robust_stage_name,
             )
         if intermediate_prompt_text and final_prompt_text != intermediate_prompt_text:
             logging.info(
-                "normalized prompt_text chars_before=%d chars_after=%d stage=robust_final",
+                "normalized prompt_text chars_before=%d chars_after=%d stage=%s",
                 len(intermediate_prompt_text),
                 len(final_prompt_text),
+                robust_stage_name,
             )
-
-    normalization_stages: list[str] = []
-    if enable_wetext:
-        normalization_stages.append(f"wetext:{normalization_language}" if normalization_language else "wetext")
-    if enable_normalize_tts_text:
-        normalization_stages.append("robust")
+        normalization_stages.append(robust_stage_name)
 
     return {
         "text": final_text,

@@ -85,6 +85,7 @@ def normalize_tts_text(text: str) -> str:
     """对 TTS 输入做鲁棒性正则化。"""
     text = _base_cleanup(text)
     text = _normalize_markdown_and_lines(text)
+    text = _normalize_flow_arrows(text)
     text, protected = _protect_spans(text)
 
     text = _normalize_spaces(text)
@@ -168,6 +169,14 @@ def _restore_spans(text: str, protected: list[str]) -> str:
     return text
 
 
+def _normalize_flow_arrows(text: str) -> str:
+    return re.sub(
+        r"\s*(?:<[-=]+>|[-=]+>|<[-=]+|[→←↔⇒⇐⇔⟶⟵⟷⟹⟸⟺↦↤↪↩])\s*",
+        "，",
+        text,
+    )
+
+
 def _normalize_spaces(text: str) -> str:
     # 统一空白
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
@@ -210,6 +219,9 @@ def _normalize_structural_punctuation(text: str) -> str:
         r"\1\2",
         text,
     )
+
+    # 流程 / 映射箭头：转成中文逗号，避免把 `->` 之类原样喂给 TTS。
+    text = _normalize_flow_arrows(text)
 
     # 长破折号 / 多连字符：转句边界
     text = re.sub(r"\s*(?:—|–|―|-){2,}\s*", "。", text)
@@ -299,6 +311,9 @@ TEST_CASES = [
     ("struct_notice", "【公告】今天 20:00 维护——预计 30 分钟。", '"公告"今天20:00维护。预计30分钟。'),
     ("struct_quote_chain", "『特别提醒』「不要外传」", '"特别提醒""不要外传"。'),
     ("struct_embedded_quote", "他说【重要通知】明天发布。", '他说"重要通知"明天发布。'),
+    ("flow_arrow_chain", "请求接入 -> 身份与策略判定 -> 域服务处理", "请求接入，身份与策略判定，域服务处理。"),
+    ("flow_arrow_no_space", "A->B", "A，B。"),
+    ("flow_arrow_unicode", "配置中心→推理编排→运行时执行", "配置中心，推理编排，运行时执行。"),
 
     # 5) 嵌入式标题：保留
     ("embedded_title", "我喜欢《哈姆雷特》这本书。", "我喜欢《哈姆雷特》这本书。"),
